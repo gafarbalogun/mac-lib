@@ -1,0 +1,1129 @@
+#!/usr/bin/env bash
+# mac-lib — unified Mac package wrapper + vulnerability scanner
+# Routes upgrade/remove/scan across brew, pip3, pipx, npm, gem, cargo, mas.
+# Refuses to touch macOS system binaries.
+
+set -u
+
+VERSION="0.5.0"
+REPORT_DIR="${HOME}/.mac-lib/reports"
+SUB="${1:-help}"
+shift || true
+
+# ---------- helpers ----------
+
+# Paths we will NEVER remove from. These are macOS itself.
+PROTECTED_PREFIXES=(
+  "/usr/bin" "/bin" "/sbin" "/usr/sbin" "/usr/libexec"
+  "/System" "/Library/Apple"
+)
+
+# Paths to exclude from filesystem scans.
+# /System + /Library/Apple are SIP-protected (you can't fix anything there).
+# The rest are caches, indexes, and trash — pure noise.
+SCAN_EXCLUDES=(
+  # NOTE: grype requires exclusion patterns to start with './', '*/', or '**/'.
+  # We store them here as path fragments and the builder prefixes '**/' below,
+  # which matches the named directory anywhere in the scanned tree.
+
+  # SIP-protected — can't be modified anyway
+  "System"
+  "Library/Apple"
+  # Caches, indexes, trash — pure noise
+  "private/var/folders"
+  "private/var/db"
+  "private/var/vm"
+  ".Spotlight-V100"
+  ".fseventsd"
+  ".DocumentRevisions-V100"
+  ".Trashes"
+  ".Trash"
+  ".cache"
+  ".npm/_cacache"
+  # Media folders — no software lives here
+  "Movies"
+  "Music"
+  "Pictures"
+  # macOS Library subdirs that don't have user-installable software
+  "Library/Caches"
+  "Library/Logs"
+  "Library/Mail"
+  "Library/Photos"
+  "Library/Containers"
+  "Library/Group Containers"
+  "Library/Mobile Documents"
+  "Library/Application Support/CrashReporter"
+  "Library/Developer/Xcode/DerivedData"
+  "Library/Developer/CoreSimulator"
+)
+
+is_protected_path() {
+  local p="$1"
+  [[ -z "$p" ]] && return 1
+  for prefix in "${PROTECTED_PREFIXES[@]}"; do
+    [[ "$p" == "$prefix"/* ]] && return 0
+  done
+  return 1
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+mkdir -p "$REPORT_DIR"
+
+# ---------- UI ----------
+# Shared visual language. Every cmd_ uses these so output stays consistent.
+
+C_RED=$'\033[1;31m'
+C_YEL=$'\033[33m'
+C_GRN=$'\033[32m'
+C_CYN=$'\033[36m'
+C_DIM=$'\033[2m'
+C_BOLD=$'\033[1m'
+C_RESET=$'\033[0m'
+
+# Severity badges — 10 visible chars each, used by scan
+B_CRIT=$'\033[1;41;97m CRITICAL \033[0m'
+B_HIGH=$'\033[1;43;30m   HIGH   \033[0m'
+B_MED=$'\033[1;46;30m  MEDIUM  \033[0m'
+B_LOW=$'\033[1;100;97m   LOW    \033[0m'
+
+ui_header() {
+  local title="$1"
+  echo ""
+  printf "  %s╭────────────────────────────────────────────────────────╮%s\n" "$C_BOLD" "$C_RESET"
+  printf "  %s│  mac-lib  ·  %-42s│%s\n" "$C_BOLD" "$title" "$C_RESET"
+  printf "  %s╰────────────────────────────────────────────────────────╯%s\n" "$C_BOLD" "$C_RESET"
+  echo ""
+}
+
+ui_section() {
+  local title="$1"
+  local count="${2:-}"
+  if [[ -n "$count" ]]; then
+    printf "  %s%s%s  %s(%s)%s\n" "$C_BOLD" "$title" "$C_RESET" "$C_DIM" "$count" "$C_RESET"
+  else
+    printf "  %s%s%s\n" "$C_BOLD" "$title" "$C_RESET"
+  fi
+  printf "  %s──────────────────────────────────────────────%s\n" "$C_DIM" "$C_RESET"
+}
+
+ui_ok()    { printf "   %s✓%s  %s\n" "$C_GRN"  "$C_RESET" "$1"; }
+ui_fail()  { printf "   %s✗%s  %s\n" "$C_RED"  "$C_RESET" "$1"; }
+ui_warn()  { printf "   %s!%s  %s\n" "$C_YEL"  "$C_RESET" "$1"; }
+ui_step()  { printf "   %s►%s  %s\n" "$C_CYN"  "$C_RESET" "$1"; }
+ui_info()  { printf "   %s·%s  %s\n" "$C_DIM"  "$C_RESET" "$1"; }
+ui_dim()   { printf "  %s%s%s\n"     "$C_DIM"  "$1"      "$C_RESET"; }
+
+ui_kv() {  # key/value row
+  printf "   %s%-10s%s  %s\n" "$C_DIM" "$1" "$C_RESET" "$2"
+}
+
+ui_footer() {
+  local msg="$1"
+  echo ""
+  printf "  %s%s%s\n" "$C_DIM" "$msg" "$C_RESET"
+  echo ""
+}
+
+# Get terminal width, default to 80 if unknown
+ui_termwidth() {
+  local w="${COLUMNS:-}"
+  [[ -z "$w" ]] && w="$(tput cols 2>/dev/null || echo 80)"
+  echo "$w"
+}
+
+# Print a list (one per line on stdin) in multiple columns based on terminal width
+ui_columns() {
+  local term_w; term_w="$(ui_termwidth)"
+  local items=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && items+=("$line")
+  done
+  [[ ${#items[@]} -eq 0 ]] && return
+
+  # Find max item width
+  local max_len=0 item
+  for item in "${items[@]}"; do
+    [[ ${#item} -gt $max_len ]] && max_len=${#item}
+  done
+
+  local indent=3 spacing=2
+  local col_width=$((max_len + spacing))
+  local n_cols=$(( (term_w - indent) / col_width ))
+  [[ $n_cols -lt 1 ]] && n_cols=1
+  [[ $n_cols -gt 6 ]] && n_cols=6   # cap at 6 cols to stay scannable
+
+  local count=0
+  for item in "${items[@]}"; do
+    [[ $count -eq 0 ]] && printf "   "
+    printf "%-${col_width}s" "$item"
+    count=$((count + 1))
+    if [[ $count -ge $n_cols ]]; then echo ""; count=0; fi
+  done
+  [[ $count -ne 0 ]] && echo ""
+}
+
+# Print a table header row given column widths and labels
+# Args: pairs of (width label) — e.g. ui_table_header 8 STATUS 13 TOOL 0 PATH
+# A width of 0 means "rest of the line / no fixed width"
+ui_table_header() {
+  printf "   "
+  while [[ $# -gt 0 ]]; do
+    local w="$1"; local label="$2"; shift 2
+    if [[ "$w" == "0" ]]; then
+      printf "%s%s%s" "$C_BOLD" "$label" "$C_RESET"
+    else
+      printf "%s%-${w}s%s  " "$C_BOLD" "$label" "$C_RESET"
+    fi
+  done
+  echo ""
+  # Underline rule based on terminal width
+  local term_w; term_w="$(ui_termwidth)"
+  local rule_w=$((term_w - 6))
+  [[ $rule_w -gt 90 ]] && rule_w=90
+  [[ $rule_w -lt 40 ]] && rule_w=40
+  printf "   %s" "$C_DIM"
+  printf '─%.0s' $(seq 1 "$rule_w")
+  printf "%s\n" "$C_RESET"
+}
+
+# Returns the package manager that owns $1, or "unknown".
+detect_manager() {
+  local pkg="$1"
+  if have brew; then
+    if brew list --formula --quiet 2>/dev/null | grep -qx "$pkg"; then echo "brew-formula"; return; fi
+    if brew list --cask    --quiet 2>/dev/null | grep -qx "$pkg"; then echo "brew-cask"; return; fi
+  fi
+  if have pipx && pipx list --short 2>/dev/null | awk '{print $1}' | grep -qx "$pkg"; then
+    echo "pipx"; return
+  fi
+  if have pip3 && pip3 show "$pkg" >/dev/null 2>&1; then echo "pip3"; return; fi
+  if have npm && npm ls -g --depth=0 --parseable 2>/dev/null | grep -qE "/$pkg$"; then
+    echo "npm-global"; return
+  fi
+  if have gem && gem list -i "^${pkg}$" >/dev/null 2>&1; then echo "gem"; return; fi
+  if have cargo && cargo install --list 2>/dev/null | grep -qE "^${pkg} v"; then echo "cargo"; return; fi
+  if have mas && mas list 2>/dev/null | grep -qi " $pkg "; then echo "mas"; return; fi
+  if have port && port installed "$pkg" 2>/dev/null | grep -qE "^ +${pkg} "; then echo "macports"; return; fi
+  if have conda && conda list -n base "^${pkg}$" 2>/dev/null | grep -qE "^${pkg}[[:space:]]"; then
+    echo "conda"; return
+  fi
+  if have yarn && yarn global list 2>/dev/null | grep -q "\"${pkg}@"; then echo "yarn-global"; return; fi
+  if have pnpm && pnpm list -g --depth=0 --parseable 2>/dev/null | grep -qE "/${pkg}$"; then
+    echo "pnpm-global"; return
+  fi
+  echo "unknown"
+}
+
+# Note: grype exclude args are now built inline in _run_scan using a bash array
+# to preserve paths with spaces. The `**/<dir>/**` form satisfies grype's
+# requirement that patterns start with './', '*/', or '**/'.
+
+# ---------- subcommands ----------
+
+cmd_help() {
+  cat <<EOF
+mac-lib v${VERSION} — unified package wrapper for macOS
+
+USAGE
+  mac-lib setup                  Install scanners (grype, trivy, syft, osv-scanner)
+                                 and any optional helpers via brew. One-time.
+  mac-lib repair                 Auto-fix common issues: missing scanners, broken
+                                 pipx, PATH problems. Safe to run anytime.
+  mac-lib doctor                 Check which underlying tools are installed.
+
+  mac-lib scan                   Scan everywhere that matters (default).
+                                 Hits /Applications, \$HOME, /opt/homebrew, /usr/local
+                                 with smart exclusions (caches, /System, etc).
+  mac-lib scan-deep              Scan / (root) minus SIP-protected paths.
+                                 Slow, may need Full Disk Access in System Settings.
+  mac-lib scan-quick             Skip filesystem; just query package managers.
+  mac-lib scan-path <dir>        Scan a specific path.
+
+  mac-lib list                   List installed packages across all managers.
+  mac-lib outdated               Show what's outdated everywhere.
+  mac-lib upgrade [pkg]          Upgrade one package, or all if no pkg given.
+  mac-lib rm <pkg>               Remove a package (refuses system binaries).
+  mac-lib which <pkg>            Show which manager owns <pkg>.
+
+REPORTS
+  Scan reports are saved to ~/.mac-lib/reports/ with timestamps.
+
+KNOWN MANAGERS
+  brew (formula + cask), pipx, pip3, npm (global), gem, cargo, mas,
+  macports (port), conda (base env), yarn (global), pnpm (global)
+EOF
+}
+
+cmd_setup() {
+  ui_header "setup — install scanners"
+
+  if ! have brew; then
+    ui_fail "Homebrew not installed"
+    ui_dim "  install it first:"
+    ui_dim "    /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+    ui_dim "  then re-run: mac-lib setup"
+    return 1
+  fi
+
+  ui_step "updating Homebrew (can take a minute)"
+  brew update >/dev/null 2>&1 || ui_warn "brew update had issues — continuing anyway"
+  echo ""
+
+  ui_section "scanners"
+  local pkgs=(grype syft trivy osv-scanner mas pipx)
+  local failed=()
+
+  for pkg in "${pkgs[@]}"; do
+    if brew list --formula --quiet 2>/dev/null | grep -qx "$pkg"; then
+      ui_ok "$pkg already installed"
+    else
+      printf "   %s…%s  installing %s\n" "$C_CYN" "$C_RESET" "$pkg"
+      if brew install "$pkg" >/dev/null 2>&1; then
+        ui_ok "$pkg installed"
+      else
+        ui_fail "$pkg install failed — try: brew install $pkg"
+        failed+=("$pkg")
+      fi
+    fi
+  done
+
+  if have pipx; then
+    echo ""
+    ui_section "pip-audit"
+    pipx ensurepath >/dev/null 2>&1 || true
+
+    if pipx list --short 2>/dev/null | awk '{print $1}' | grep -qx pip-audit; then
+      ui_ok "pip-audit already installed"
+      pipx upgrade pip-audit >/dev/null 2>&1 || true
+    elif pipx install pip-audit >/dev/null 2>&1; then
+      ui_ok "pip-audit installed via pipx"
+    else
+      ui_warn "pipx failed — clearing stale shared venv and retrying"
+      rm -rf "${HOME}/.local/pipx/shared" 2>/dev/null || true
+      if pipx install pip-audit >/dev/null 2>&1; then
+        ui_ok "pip-audit installed (after cache clear)"
+      elif have pip3 && pip3 install --user --quiet pip-audit 2>/dev/null; then
+        ui_ok "pip-audit installed via pip3 --user"
+        local pyver; pyver="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo '3.x')"
+        ui_dim "       add to ~/.zshrc if not on PATH:"
+        ui_dim "         export PATH=\"\$HOME/Library/Python/${pyver}/bin:\$PATH\""
+      else
+        ui_fail "pip-audit failed via all methods"
+        ui_dim "       try manually: rm -rf ~/.local/pipx && pipx install pip-audit"
+        failed+=("pip-audit")
+      fi
+    fi
+  fi
+
+  echo ""
+  cmd_doctor
+
+  if [[ ${#failed[@]} -gt 0 ]]; then
+    ui_warn "some packages failed: ${failed[*]}"
+    return 1
+  fi
+}
+
+cmd_doctor() {
+  ui_header "doctor — tool inventory"
+
+  ui_table_header 8 "STATUS" 13 "TOOL" 0 "PATH"
+
+  local total=0 ok=0
+  for tool in brew pipx pip3 npm gem cargo mas port conda yarn pnpm grype trivy syft osv-scanner pip-audit; do
+    total=$((total + 1))
+    if have "$tool"; then
+      ok=$((ok + 1))
+      printf "   %s%-8s%s  %-13s  %s%s%s\n" \
+        "$C_GRN" "✓ ok"  "$C_RESET" "$tool" "$C_DIM" "$(command -v "$tool")" "$C_RESET"
+    else
+      printf "   %s%-8s%s  %-13s  %s%s%s\n" \
+        "$C_RED" "✗ none" "$C_RESET" "$tool" "$C_DIM" "not installed" "$C_RESET"
+    fi
+  done
+
+  echo ""
+  if [[ $ok -eq $total ]]; then
+    printf "  %s%d of %d tools installed%s  %s· all set%s\n" \
+      "$C_DIM" "$ok" "$total" "$C_RESET" "$C_GRN" "$C_RESET"
+  else
+    printf "  %s%d of %d tools installed%s  %s· run 'mac-lib repair' to auto-fix%s\n" \
+      "$C_DIM" "$ok" "$total" "$C_RESET" "$C_YEL" "$C_RESET"
+  fi
+  echo ""
+}
+
+cmd_repair() {
+  ui_header "repair — auto-diagnose and fix"
+
+  local found=0 fixed=0
+
+  ui_section "homebrew"
+  if ! have brew; then
+    ui_fail "Homebrew missing — installing"
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    found=$((found+1))
+    if [[ -x /opt/homebrew/bin/brew ]]; then
+      eval "$(/opt/homebrew/bin/brew shellenv)"; fixed=$((fixed+1))
+    elif [[ -x /usr/local/bin/brew ]]; then
+      eval "$(/usr/local/bin/brew shellenv)"; fixed=$((fixed+1))
+    fi
+  else
+    ui_ok "brew at $(command -v brew)"
+  fi
+  if ! have brew; then
+    ui_fail "brew still missing — bailing"
+    return 1
+  fi
+  brew update >/dev/null 2>&1 || true
+
+  echo ""
+  ui_section "scanners"
+  for tool in grype syft trivy osv-scanner mas pipx; do
+    if have "$tool"; then
+      ui_ok "$tool"
+    else
+      ui_fail "$tool missing — installing"
+      found=$((found+1))
+      if brew install "$tool" >/dev/null 2>&1; then
+        ui_ok "$tool installed"
+        fixed=$((fixed+1))
+      else
+        ui_fail "brew install $tool failed"
+      fi
+    fi
+  done
+
+  echo ""
+  ui_section "pip-audit"
+  if have pip-audit; then
+    ui_ok "pip-audit"
+  else
+    ui_fail "pip-audit missing — trying pipx, then pip3 fallback"
+    found=$((found+1))
+    pipx ensurepath >/dev/null 2>&1 || true
+    if pipx install pip-audit >/dev/null 2>&1; then
+      ui_ok "pip-audit installed via pipx"
+      fixed=$((fixed+1))
+    else
+      ui_warn "pipx failed — clearing stale venv and retrying"
+      rm -rf "${HOME}/.local/pipx/shared" 2>/dev/null || true
+      if pipx install pip-audit >/dev/null 2>&1; then
+        ui_ok "pip-audit installed (after cache clear)"
+        fixed=$((fixed+1))
+      elif have pip3 && pip3 install --user --quiet pip-audit 2>/dev/null; then
+        ui_ok "pip-audit installed via pip3 --user"
+        fixed=$((fixed+1))
+        ui_dim "       you may need ~/Library/Python/3.x/bin on PATH"
+      else
+        ui_fail "pip-audit install failed via every method"
+      fi
+    fi
+  fi
+
+  echo ""
+  ui_section "PATH"
+  case ":$PATH:" in
+    *":/usr/local/bin:"*) ui_ok "/usr/local/bin on PATH" ;;
+    *)
+      ui_fail "/usr/local/bin NOT on PATH"
+      ui_dim "       add to ~/.zshrc:  export PATH=\"/usr/local/bin:\$PATH\""
+      found=$((found+1))
+      ;;
+  esac
+  hash -r 2>/dev/null || true
+
+  echo ""
+  if [[ $found -eq 0 ]]; then
+    printf "  %s● nothing to repair · system clean%s\n" "$C_GRN" "$C_RESET"
+  else
+    printf "  %s%d of %d issues fixed%s\n" "$C_DIM" "$fixed" "$found" "$C_RESET"
+  fi
+  echo ""
+  cmd_doctor
+}
+
+# Core scan engine. Single grype run per path; live progress; colored output.
+_run_scan() {
+  local label="$1"; shift
+  local paths=("$@")
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local report="${REPORT_DIR}/${stamp}-${label}.txt"
+
+  if ! have grype; then
+    ui_fail "grype not installed. Run 'mac-lib setup' first."
+    return 1
+  fi
+
+  # Build excludes as a proper bash array — preserves paths with spaces.
+  # Grype requires patterns to start with './', '*/', or '**/' — we use '**/'
+  # which matches the directory name at any depth in the scanned tree.
+  local exclude_args=()
+  local d
+  for d in "${SCAN_EXCLUDES[@]}"; do
+    exclude_args+=(--exclude "**/${d}/**")
+  done
+
+  # On-disk report
+  {
+    echo "=========================================="
+    echo "mac-lib scan report"
+    echo "label : $label"
+    echo "when  : $(date)"
+    echo "paths : ${paths[*]}"
+    echo "=========================================="
+  } > "$report"
+
+  ui_header "scan — $label"
+  ui_kv "when" "$(date '+%Y-%m-%d %H:%M:%S')"
+  for p in "${paths[@]}"; do
+    ui_kv "path" "$p"
+  done
+  echo ""
+
+  local grand_crit=0 grand_high=0
+  local idx=0 total=${#paths[@]}
+
+  for p in "${paths[@]}"; do
+    [[ -e "$p" ]] || continue
+    idx=$((idx + 1))
+
+    # Live "scanning" line — overwritten with results when done via \r
+    printf "  %s[%d/%d]%s %-50s %sscanning…%s" \
+      "$C_DIM" "$idx" "$total" "$C_RESET" "$p" "$C_DIM" "$C_RESET"
+
+    local start=$SECONDS
+    local json_file; json_file="$(mktemp -t maclib.json.XXXXXX)"
+    local err_file;  err_file="$(mktemp  -t maclib.err.XXXXXX)"
+
+    # Single grype run, JSON output via --file. Bash array preserves spaces.
+    grype "dir:$p" --only-fixed -o json --file "$json_file" "${exclude_args[@]}" 2>"$err_file"
+    local exit_code=$?
+
+    local elapsed=$((SECONDS - start))
+
+    # grype exit codes: 0 = no vulns, 1 = vulns found, 2 = error.
+    # Anything else is unusual; treat as an error too.
+    if [[ $exit_code -ne 0 && $exit_code -ne 1 ]]; then
+      printf "\r  %s[%d/%d]%s %-50s %s✗ grype error (exit %d)%s\n" \
+        "$C_DIM" "$idx" "$total" "$C_RESET" "$p" "$C_RED" "$exit_code" "$C_RESET"
+      head -5 "$err_file" 2>/dev/null | sed 's/^/      /'
+      rm -f "$json_file" "$err_file"
+      continue
+    fi
+
+    # Suspicious-fast detection: scanned in <2s with zero findings AND there's
+    # stderr output → almost certainly a silent error, not a clean repo.
+    local crit high
+    crit=$(grep -c '"severity":"Critical"' "$json_file" 2>/dev/null || echo 0)
+    high=$(grep -c '"severity":"High"'     "$json_file" 2>/dev/null || echo 0)
+    crit=${crit//[^0-9]/}; crit=${crit:-0}
+    high=${high//[^0-9]/}; high=${high:-0}
+
+    if [[ $elapsed -lt 2 && $((crit + high)) -eq 0 && -s "$err_file" ]]; then
+      printf "\r  %s[%d/%d]%s %-50s %s! suspicious: 0 findings in %ss%s\n" \
+        "$C_DIM" "$idx" "$total" "$C_RESET" "$p" "$C_YEL" "$elapsed" "$C_RESET"
+      head -5 "$err_file" 2>/dev/null | sed 's/^/      /'
+    fi
+
+    grand_crit=$((grand_crit + crit))
+    grand_high=$((grand_high + high))
+
+    # Overwrite the "scanning…" line with the finished status
+    printf "\r  %s[%d/%d]%s %-50s %s● %3d crit%s  %s● %3d high%s  %s(%ss)%s\n" \
+      "$C_DIM" "$idx" "$total" "$C_RESET" "$p" \
+      "$C_RED" "$crit" "$C_RESET" \
+      "$C_YEL" "$high" "$C_RESET" \
+      "$C_DIM" "$elapsed" "$C_RESET"
+
+    # Show top findings inline — Docker Scout style: severity badges + CVSS + sorted
+    if [[ $((crit + high)) -gt 0 ]] && have python3; then
+      python3 - "$json_file" 10 <<'PYEOF'
+import json, sys
+
+# Severity badges with background colors (10 visible chars each so columns align)
+BADGES = {
+    'Critical': '\033[1;41;97m CRITICAL \033[0m',  # white-on-red
+    'High':     '\033[1;43;30m   HIGH   \033[0m',  # black-on-yellow
+    'Medium':   '\033[1;46;30m  MEDIUM  \033[0m',  # black-on-cyan
+    'Low':      '\033[1;100;97m   LOW    \033[0m', # white-on-gray
+}
+DIM, BOLD, RESET = '\033[2m', '\033[1m', '\033[0m'
+
+def cvss_score(v):
+    cvss = v.get('cvss') or []
+    # Prefer v3.x scores
+    for c in cvss:
+        if str(c.get('version', '')).startswith('3'):
+            s = (c.get('metrics') or {}).get('baseScore')
+            if s is not None: return s
+    for c in cvss:
+        s = (c.get('metrics') or {}).get('baseScore')
+        if s is not None: return s
+    return None
+
+def fix_version(v):
+    fix = v.get('fix') or {}
+    vers = fix.get('versions') or []
+    return vers[0] if vers else 'none'
+
+def is_apple_noise(m):
+    locs = (m.get('artifact') or {}).get('locations') or []
+    if not locs: return False
+    p = (locs[0] or {}).get('path', '')
+    return '/Library/Apple/' in p or p.startswith('/System/')
+
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+
+max_show = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+
+matches = [m for m in (data.get('matches') or [])
+           if (m.get('vulnerability') or {}).get('severity') in ('Critical', 'High')
+           and not is_apple_noise(m)]
+
+# Sort: Critical first, then by CVSS descending
+matches.sort(key=lambda m: (
+    0 if m['vulnerability'].get('severity') == 'Critical' else 1,
+    -(cvss_score(m['vulnerability']) or 0)
+))
+
+# Dedupe by (package, cve)
+seen, deduped = set(), []
+for m in matches:
+    a = m.get('artifact') or {}
+    v = m.get('vulnerability') or {}
+    key = (a.get('name', ''), v.get('id', ''))
+    if key not in seen:
+        seen.add(key)
+        deduped.append(m)
+
+if not deduped:
+    sys.exit(0)
+
+# Header
+print()
+print(f"   {BOLD}{'SEVERITY':<10}{RESET} {BOLD}{'CVSS':>4}{RESET}  "
+      f"{BOLD}{'CVE':<17}{RESET} {BOLD}{'PACKAGE':<24}{RESET} "
+      f"{BOLD}{'VERSION':<14}{RESET} {BOLD}{'FIX':<12}{RESET}")
+print(f"   {DIM}{'─' * 90}{RESET}")
+
+# Rows
+for m in deduped[:max_show]:
+    v = m['vulnerability']
+    a = m.get('artifact') or {}
+    sev = v.get('severity', '?')
+    badge = BADGES.get(sev, f' {sev:8s} ')
+    score = cvss_score(v)
+    score_str = f"{score:>4.1f}" if isinstance(score, (int, float)) else '   -'
+    cve = (v.get('id') or '?')[:17]
+    name = (a.get('name') or '?')[:24]
+    ver = (a.get('version') or '?')[:14]
+    fix = fix_version(v)[:12]
+    print(f"   {badge} {score_str}  {cve:<17} "
+          f"{BOLD}{name:<24}{RESET} {DIM}{ver:<14}{RESET} {BOLD}{fix:<12}{RESET}")
+
+remaining = len(deduped) - max_show
+if remaining > 0:
+    print(f"   {DIM}… and {remaining} more (full list in report file){RESET}")
+print()
+PYEOF
+    elif [[ $((crit + high)) -gt 0 ]]; then
+      ui_warn "python3 missing — install for nicer formatting"
+    fi
+
+    # Append a full text table to the on-disk report (generated from JSON via Python)
+    {
+      echo ""
+      echo "── grype: $p ──"
+      if have python3 && [[ -s "$json_file" ]]; then
+        python3 - "$json_file" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"(could not parse JSON: {e})"); sys.exit(0)
+
+matches = d.get('matches') or []
+if not matches:
+    print("(no findings)"); sys.exit(0)
+
+# Sort: Critical first, then High, then by name
+SEV_ORDER = {'Critical': 0, 'High': 1, 'Medium': 2, 'Low': 3, 'Negligible': 4, 'Unknown': 5}
+matches.sort(key=lambda m: (
+    SEV_ORDER.get((m.get('vulnerability') or {}).get('severity', 'Unknown'), 99),
+    (m.get('artifact') or {}).get('name', '')
+))
+
+print(f"{'NAME':<32} {'INSTALLED':<18} {'FIXED-IN':<16} {'TYPE':<10} {'CVE':<18} {'SEVERITY'}")
+print("-" * 110)
+for m in matches:
+    v = m.get('vulnerability') or {}
+    a = m.get('artifact') or {}
+    fix_versions = (v.get('fix') or {}).get('versions') or []
+    fix = fix_versions[0] if fix_versions else 'none'
+    print(f"{(a.get('name') or '?')[:32]:<32} "
+          f"{(a.get('version') or '?')[:18]:<18} "
+          f"{fix[:16]:<16} "
+          f"{(a.get('type') or '?')[:10]:<10} "
+          f"{(v.get('id') or '?')[:18]:<18} "
+          f"{v.get('severity', '?')}")
+PYEOF
+      else
+        cat "$json_file" 2>/dev/null | head -20
+      fi
+    } >> "$report"
+
+    rm -f "$json_file" "$err_file"
+  done
+
+  # Bonus: pip-audit (Python package CVEs)
+  if have pip-audit; then
+    ui_section "pip-audit (user site-packages)"
+    pip-audit --progress-spinner off 2>&1 | head -10 | sed 's/^/   /' || true
+    echo ""
+    {
+      echo ""
+      echo "── pip-audit ──"
+      pip-audit --progress-spinner off 2>&1 || true
+    } >> "$report"
+  fi
+
+  # Final summary card
+  echo ""
+  printf "  %s╭────────────────────────────────────────────────────────╮%s\n" "$C_BOLD" "$C_RESET"
+  printf "  %s│  Summary                                               │%s\n" "$C_BOLD" "$C_RESET"
+  printf "  %s╰────────────────────────────────────────────────────────╯%s\n" "$C_BOLD" "$C_RESET"
+  if [[ $((grand_crit + grand_high)) -eq 0 ]]; then
+    printf "  %s● 0 Critical%s    %s● 0 High%s   %sclean%s\n" \
+      "$C_GRN" "$C_RESET" "$C_GRN" "$C_RESET" "$C_GRN" "$C_RESET"
+  else
+    printf "  %s● %d Critical%s    %s● %d High%s\n" \
+      "$C_RED" "$grand_crit" "$C_RESET" "$C_YEL" "$grand_high" "$C_RESET"
+  fi
+  echo ""
+  printf "  %sFull report: %s%s\n" "$C_DIM" "$report" "$C_RESET"
+  echo ""
+}
+
+cmd_scan() {
+  local paths=()
+  [[ -d "/Applications" ]]   && paths+=("/Applications")
+  [[ -d "$HOME" ]]           && paths+=("$HOME")
+  [[ -d "/opt/homebrew" ]]   && paths+=("/opt/homebrew")
+  [[ -d "/usr/local" ]]      && paths+=("/usr/local")
+  _run_scan "default" "${paths[@]}"
+}
+
+cmd_scan_deep() {
+  echo "!!! scan-deep walks all of / minus SIP-protected paths."
+  echo "!!! This will take a while and may prompt for Full Disk Access."
+  echo "!!! Press Ctrl-C in 5s to abort, or wait to continue..."
+  sleep 5
+  _run_scan "deep" "/"
+}
+
+cmd_scan_quick() {
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local report="${REPORT_DIR}/${stamp}-quick.txt"
+
+  ui_header "scan-quick — package managers only"
+
+  {
+    echo "=== mac-lib quick scan ==="
+    echo "when: $(date)"
+    echo ""
+  } > "$report"
+
+  if have brew; then
+    local n; n=$(brew outdated --quiet 2>/dev/null | wc -l | tr -d ' ')
+    ui_section "brew outdated" "$n"
+    if [[ $n -eq 0 ]]; then
+      ui_dim "   all up to date"
+    else
+      brew outdated --verbose 2>/dev/null | sed 's/^/   /'
+    fi
+    {
+      echo ""
+      echo "── brew outdated ──"
+      brew outdated --verbose 2>/dev/null
+    } >> "$report"
+    echo ""
+  fi
+
+  if have pip-audit; then
+    ui_section "pip-audit"
+    pip-audit --progress-spinner off 2>&1 | sed 's/^/   /' || ui_dim "   no findings"
+    {
+      echo ""
+      echo "── pip-audit ──"
+      pip-audit --progress-spinner off 2>&1
+    } >> "$report"
+    echo ""
+  fi
+
+  if have npm; then
+    ui_section "npm audit (global)"
+    (cd "$(npm root -g)/.." && npm audit 2>&1 | sed 's/^/   /') || ui_dim "   (no global package.json)"
+    echo ""
+  fi
+
+  if have mas; then
+    ui_section "App Store"
+    mas outdated 2>/dev/null | sed 's/^/   /' || ui_dim "   all up to date"
+    echo ""
+  fi
+
+  ui_footer "report: $report"
+}
+
+cmd_scan_path() {
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    echo "usage: mac-lib scan-path <dir>" >&2; return 2
+  fi
+  _run_scan "path-$(basename "$target")" "$target"
+}
+
+cmd_list() {
+  ui_header "installed packages"
+
+  if have brew; then
+    local n; n=$(brew list --formula 2>/dev/null | wc -l | tr -d ' ')
+    ui_section "brew formulae" "$n"
+    brew list --formula 2>/dev/null | ui_columns
+    echo ""
+
+    n=$(brew list --cask 2>/dev/null | wc -l | tr -d ' ')
+    ui_section "brew casks" "$n"
+    brew list --cask 2>/dev/null | ui_columns
+    echo ""
+  fi
+  if have pipx; then
+    local n; n=$(pipx list --short 2>/dev/null | wc -l | tr -d ' ')
+    ui_section "pipx" "$n"
+    pipx list --short 2>/dev/null | awk '{print $1}' | ui_columns
+    echo ""
+  fi
+  if have pip3; then
+    local n; n=$(pip3 list --user 2>/dev/null | tail -n +3 | wc -l | tr -d ' ')
+    ui_section "pip3 (user)" "$n"
+    pip3 list --user 2>/dev/null | tail -n +3 | awk '{print $1}' | ui_columns
+    echo ""
+  fi
+  if have npm; then
+    ui_section "npm global"
+    npm ls -g --depth=0 --parseable 2>/dev/null \
+      | awk -F/ 'NR>1 {print $NF}' | ui_columns
+    echo ""
+  fi
+  if have gem; then
+    local n; n=$(gem list 2>/dev/null | wc -l | tr -d ' ')
+    ui_section "gems" "$n"
+    gem list 2>/dev/null | awk '{print $1}' | ui_columns
+    echo ""
+  fi
+  if have cargo; then
+    ui_section "cargo"
+    cargo install --list 2>/dev/null | awk '/^[a-zA-Z]/ {print $1}' | ui_columns
+    echo ""
+  fi
+  if have mas; then
+    ui_section "App Store"
+    mas list 2>/dev/null | sed 's/^/   /'
+    echo ""
+  fi
+  if have port; then
+    local n; n=$(port installed 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+    ui_section "macports" "$n"
+    port installed 2>/dev/null | tail -n +2 | awk '{print $1}' | ui_columns
+    echo ""
+  fi
+  if have conda; then
+    ui_section "conda (base)"
+    conda list -n base 2>/dev/null | grep -v "^#" | awk '{print $1}' | ui_columns
+    echo ""
+  fi
+  if have yarn; then
+    ui_section "yarn global"
+    yarn global list 2>/dev/null | grep '^info "' | sed -E 's/^info "([^@]+)@.*/\1/' | ui_columns
+    echo ""
+  fi
+  if have pnpm; then
+    ui_section "pnpm global"
+    pnpm list -g --depth=0 --parseable 2>/dev/null | awk -F/ 'NR>1 {print $NF}' | ui_columns
+    echo ""
+  fi
+}
+
+cmd_outdated() {
+  ui_header "outdated packages"
+
+  if have brew; then
+    local out; out="$(brew outdated --verbose 2>/dev/null)"
+    local n=0
+    [[ -n "$out" ]] && n=$(echo "$out" | wc -l | tr -d ' ')
+    ui_section "brew" "$n"
+    if [[ $n -eq 0 ]]; then
+      ui_dim "   all up to date"
+    else
+      ui_table_header 28 "PACKAGE" 18 "INSTALLED" 0 "LATEST"
+      echo "$out" | awk -v dim="$C_DIM" -v reset="$C_RESET" -v bold="$C_BOLD" '
+        { gsub(/[()]/, "")
+          # brew outdated --verbose format: name (current) < latest
+          printf "   %-28s  %-18s  %s→%s  %s%s%s\n", $1, $2, dim, reset, bold, $4, reset }'
+    fi
+    echo ""
+  fi
+
+  if have pip3; then
+    local out; out="$(pip3 list --outdated --user --format=columns 2>/dev/null | tail -n +3)"
+    local n=0
+    [[ -n "$out" ]] && n=$(echo "$out" | wc -l | tr -d ' ')
+    ui_section "pip3 (user)" "$n"
+    if [[ $n -eq 0 ]]; then
+      ui_dim "   all up to date"
+    else
+      ui_table_header 28 "PACKAGE" 18 "INSTALLED" 0 "LATEST"
+      echo "$out" | awk -v dim="$C_DIM" -v reset="$C_RESET" -v bold="$C_BOLD" '
+        { printf "   %-28s  %-18s  %s→%s  %s%s%s\n", $1, $2, dim, reset, bold, $3, reset }'
+    fi
+    echo ""
+  fi
+
+  if have npm; then
+    local out; out="$(npm outdated -g --parseable 2>/dev/null)"
+    local n=0
+    [[ -n "$out" ]] && n=$(echo "$out" | wc -l | tr -d ' ')
+    ui_section "npm global" "$n"
+    if [[ $n -eq 0 ]]; then
+      ui_dim "   all up to date"
+    else
+      ui_table_header 28 "PACKAGE" 18 "INSTALLED" 0 "LATEST"
+      echo "$out" | awk -F: -v dim="$C_DIM" -v reset="$C_RESET" -v bold="$C_BOLD" '
+        { split($2, p1, "@"); name = p1[1]; cur = p1[2]
+          split($3, p2, "@"); wanted = p2[2]
+          printf "   %-28s  %-18s  %s→%s  %s%s%s\n", name, cur, dim, reset, bold, wanted, reset }'
+    fi
+    echo ""
+  fi
+
+  if have mas; then
+    ui_section "App Store"
+    mas outdated 2>/dev/null | sed 's/^/   /' || ui_dim "   all up to date"
+    echo ""
+  fi
+
+  if have port; then
+    local out; out="$(port outdated 2>/dev/null | tail -n +2)"
+    local n=0
+    [[ -n "$out" ]] && n=$(echo "$out" | wc -l | tr -d ' ')
+    ui_section "macports" "$n"
+    if [[ $n -eq 0 ]]; then
+      ui_dim "   all up to date"
+    else
+      ui_table_header 28 "PACKAGE" 18 "INSTALLED" 0 "LATEST"
+      echo "$out" | awk -v dim="$C_DIM" -v reset="$C_RESET" -v bold="$C_BOLD" '
+        { printf "   %-28s  %-18s  %s→%s  %s%s%s\n", $1, $2, dim, reset, bold, $4, reset }'
+    fi
+    echo ""
+  fi
+
+  if have conda; then
+    ui_section "conda (base)"
+    local out; out="$(conda update -n base --all --dry-run 2>/dev/null | awk '/^  [a-zA-Z0-9_.-]+ *[0-9]/')"
+    if [[ -z "$out" ]]; then
+      ui_dim "   all up to date"
+    else
+      echo "$out" | sed 's/^/   /'
+    fi
+    echo ""
+  fi
+
+  if have yarn; then
+    ui_section "yarn global"
+    local out; out="$(yarn global outdated 2>/dev/null | grep -E '^[a-zA-Z@]')"
+    if [[ -z "$out" ]]; then
+      ui_dim "   all up to date"
+    else
+      echo "$out" | sed 's/^/   /'
+    fi
+    echo ""
+  fi
+
+  if have pnpm; then
+    ui_section "pnpm global"
+    local out; out="$(pnpm outdated -g 2>/dev/null)"
+    if [[ -z "$out" ]]; then
+      ui_dim "   all up to date"
+    else
+      echo "$out" | sed 's/^/   /'
+    fi
+    echo ""
+  fi
+}
+
+cmd_upgrade() {
+  local pkg="${1:-}"
+
+  if [[ -z "$pkg" ]]; then
+    ui_header "upgrade — every package manager"
+    if have brew; then
+      ui_step "brew upgrade"
+      brew upgrade
+      echo ""
+      ui_step "brew upgrade --cask --greedy"
+      brew upgrade --cask --greedy
+      echo ""
+    fi
+    if have pipx; then
+      ui_step "pipx upgrade-all"
+      pipx upgrade-all
+      echo ""
+    fi
+    if have npm; then
+      ui_step "npm update -g"
+      npm update -g
+      echo ""
+    fi
+    if have mas; then
+      ui_step "mas upgrade"
+      mas upgrade
+      echo ""
+    fi
+    if have port; then
+      ui_step "sudo port upgrade outdated"
+      sudo port upgrade outdated
+      echo ""
+    fi
+    if have conda; then
+      ui_step "conda update -n base --all -y"
+      conda update -n base --all -y
+      echo ""
+    fi
+    if have yarn; then
+      ui_step "yarn global upgrade"
+      yarn global upgrade
+      echo ""
+    fi
+    if have pnpm; then
+      ui_step "pnpm update -g"
+      pnpm update -g
+      echo ""
+    fi
+    ui_ok "upgrade complete"
+    return
+  fi
+
+  ui_header "upgrade $pkg"
+  local mgr; mgr="$(detect_manager "$pkg")"
+  ui_kv "manager" "$mgr"
+  echo ""
+
+  case "$mgr" in
+    brew-formula) ui_step "brew upgrade $pkg"; brew upgrade "$pkg" && ui_ok "upgraded" ;;
+    brew-cask)    ui_step "brew upgrade --cask $pkg"; brew upgrade --cask "$pkg" && ui_ok "upgraded" ;;
+    pipx)         ui_step "pipx upgrade $pkg"; pipx upgrade "$pkg" && ui_ok "upgraded" ;;
+    pip3)         ui_step "pip3 install --user --upgrade $pkg"; pip3 install --user --upgrade "$pkg" && ui_ok "upgraded" ;;
+    npm-global)   ui_step "npm update -g $pkg"; npm update -g "$pkg" && ui_ok "upgraded" ;;
+    gem)          ui_step "gem update $pkg"; gem update "$pkg" && ui_ok "upgraded" ;;
+    cargo)        ui_step "cargo install $pkg --force"; cargo install "$pkg" --force && ui_ok "upgraded" ;;
+    mas)          ui_step "mas upgrade"; mas upgrade && ui_ok "upgraded" ;;
+    macports)     ui_step "sudo port upgrade $pkg"; sudo port upgrade "$pkg" && ui_ok "upgraded" ;;
+    conda)        ui_step "conda update -n base -y $pkg"; conda update -n base -y "$pkg" && ui_ok "upgraded" ;;
+    yarn-global)  ui_step "yarn global upgrade $pkg"; yarn global upgrade "$pkg" && ui_ok "upgraded" ;;
+    pnpm-global)  ui_step "pnpm update -g $pkg"; pnpm update -g "$pkg" && ui_ok "upgraded" ;;
+    unknown)      ui_fail "'$pkg' not found in any tracked manager"; return 1 ;;
+  esac
+  echo ""
+}
+
+cmd_rm() {
+  local pkg="${1:-}"
+  if [[ -z "$pkg" ]]; then ui_fail "usage: mac-lib rm <package>"; return 2; fi
+
+  ui_header "rm $pkg"
+
+  local bin_path; bin_path="$(command -v "$pkg" 2>/dev/null || true)"
+  if is_protected_path "$bin_path"; then
+    ui_fail "REFUSED — '$pkg' resolves to $bin_path"
+    ui_dim "       that's macOS itself; mac-lib will not modify protected system paths"
+    echo ""
+    return 1
+  fi
+
+  local mgr; mgr="$(detect_manager "$pkg")"
+  ui_kv "manager" "$mgr"
+  echo ""
+
+  case "$mgr" in
+    brew-formula) ui_step "brew uninstall $pkg"; brew uninstall "$pkg" && ui_ok "removed" ;;
+    brew-cask)    ui_step "brew uninstall --cask $pkg"; brew uninstall --cask "$pkg" && ui_ok "removed" ;;
+    pipx)         ui_step "pipx uninstall $pkg"; pipx uninstall "$pkg" && ui_ok "removed" ;;
+    pip3)
+      local loc
+      loc="$(pip3 show "$pkg" 2>/dev/null | awk -F': ' '/^Location/{print $2}')"
+      if [[ "$loc" == /usr/* || "$loc" == /System/* || "$loc" == /Library/Apple/* ]]; then
+        ui_fail "REFUSED — '$pkg' lives in $loc (system Python)"
+        return 1
+      fi
+      ui_step "pip3 uninstall -y $pkg"; pip3 uninstall -y "$pkg" && ui_ok "removed" ;;
+    npm-global)   ui_step "npm uninstall -g $pkg"; npm uninstall -g "$pkg" && ui_ok "removed" ;;
+    gem)          ui_step "gem uninstall $pkg"; gem uninstall "$pkg" && ui_ok "removed" ;;
+    cargo)        ui_step "cargo uninstall $pkg"; cargo uninstall "$pkg" && ui_ok "removed" ;;
+    mas)          ui_warn "App Store apps: remove via Finder"; return 1 ;;
+    macports)     ui_step "sudo port uninstall $pkg"; sudo port uninstall "$pkg" && ui_ok "removed" ;;
+    conda)        ui_step "conda remove -n base -y $pkg"; conda remove -n base -y "$pkg" && ui_ok "removed" ;;
+    yarn-global)  ui_step "yarn global remove $pkg"; yarn global remove "$pkg" && ui_ok "removed" ;;
+    pnpm-global)  ui_step "pnpm remove -g $pkg"; pnpm remove -g "$pkg" && ui_ok "removed" ;;
+    unknown)
+      ui_fail "'$pkg' not found in any tracked manager"
+      ui_dim "       if it's a manually-placed binary, mac-lib won't touch it"
+      return 1 ;;
+  esac
+  echo ""
+}
+
+cmd_which() {
+  local pkg="${1:-}"
+  if [[ -z "$pkg" ]]; then ui_fail "usage: mac-lib which <package>"; return 2; fi
+
+  ui_header "which $pkg"
+
+  local mgr; mgr="$(detect_manager "$pkg")"
+  local bin_path; bin_path="$(command -v "$pkg" 2>/dev/null || echo '(not on PATH)')"
+
+  ui_kv "package" "$pkg"
+  ui_kv "manager" "$mgr"
+  ui_kv "binary"  "$bin_path"
+
+  if is_protected_path "$bin_path"; then
+    echo ""
+    ui_warn "protected system path — mac-lib rm would refuse"
+  fi
+  echo ""
+}
+
+# ---------- dispatch ----------
+
+case "$SUB" in
+  setup)                  cmd_setup           ;;
+  repair|fix)             cmd_repair          ;;
+  doctor)                 cmd_doctor          ;;
+  scan)                   cmd_scan            ;;
+  scan-deep)              cmd_scan_deep       ;;
+  scan-quick)             cmd_scan_quick      ;;
+  scan-path)              cmd_scan_path  "$@" ;;
+  list|ls)                cmd_list            ;;
+  outdated|old)           cmd_outdated        ;;
+  upgrade|up|update)      cmd_upgrade    "$@" ;;
+  rm|remove|uninstall)    cmd_rm         "$@" ;;
+  which|info)             cmd_which      "$@" ;;
+  version|--version|-v|-V) echo "mac-lib v${VERSION}" ;;
+  help|-h|--help|"")      cmd_help            ;;
+  *) echo "unknown subcommand: $SUB" >&2; cmd_help; exit 2 ;;
+esac
