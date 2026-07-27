@@ -59,6 +59,10 @@ brew (formula + cask), pipx, pip3, npm (global), gem, cargo, mas, MacPorts (`por
 - [Homebrew](https://brew.sh) (used to install the vulnerability scanners)
 - Python 3 (for formatted scan output; falls back gracefully without it)
 
+## Writeup
+
+[I let Claude write my code — the work that mattered was somewhere else](https://medium.com/@gafar.cloud/i-let-claude-write-my-code-the-work-that-mattered-was-somewhere-else-d53750d4359f)
+
 ## License
 
 MIT
